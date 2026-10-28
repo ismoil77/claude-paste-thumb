@@ -48,11 +48,12 @@ test('parsePngSize refuses what is not a PNG', async () => {
   expect(parsePngSize('')).toBeNull()
 })
 
-test('boxFor keeps the picture\'s proportions and stays inside the room', async () => {
+test('boxFor keeps the picture\'s proportions, inside the room and never wider than 48 cells', async () => {
   expect(boxFor(480, 270, 10, 100)).toEqual({ columns: 36, rows: 10 }) // 16:9, a cell is twice as tall as wide
   expect(boxFor(360, 423, 10, 100)).toEqual({ columns: 17, rows: 10 }) // portrait
   expect(boxFor(480, 270, 6, 12)).toEqual({ columns: 12, rows: 3 }) // a narrow room caps the width, the height follows
   expect(boxFor(6000, 400, 10, 100)).toEqual({ columns: 48, rows: 2 }) // never wider than 48 cells
+  expect(boxFor(1600, 400, 10, 100)).toEqual({ columns: 48, rows: 6 }) // 4:1 stays 4:1 under that cap too
   expect(boxFor(480, 270, 6, 1)).toEqual({ columns: 2, rows: 1 }) // very little room
   expect(boxFor(10, 480, 10, 100)).toEqual({ columns: 2, rows: 10 }) // a needle still gets two columns
 })

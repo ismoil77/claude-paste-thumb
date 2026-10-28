@@ -3,7 +3,7 @@
 /** Longest side of a converted thumbnail, in pixels. */
 export const SIDE = 480
 
-/** How tall a thumbnail is, in terminal rows, and how wide it may get, in cells. */
+/** The most rows a thumbnail takes, and the most cells wide it may get. */
 export const ROWS = 10
 export const MAX_COLUMNS = 48
 
@@ -31,8 +31,9 @@ export function tempRoot(tmpdir: string | undefined, uid: string): string {
 }
 
 /**
- * Width and height of a PNG from `od -An -tu1 -N24 <file>`: the 8-byte signature, then the IHDR
- * chunk, whose first two numbers are the size. Null for anything that is not a PNG.
+ * Width and height of a PNG from `od -An -tu1 -N24 <file>`: the 8-byte signature, the IHDR chunk's
+ * 4-byte length and its name, then width and height as 4 bytes each (bytes 16 to 23). Null for
+ * anything that is not a PNG.
  */
 export function parsePngSize(odOutput: string): { width: number; height: number } | null {
   const b = odOutput.trim().split(/\s+/).map(Number)
@@ -76,13 +77,15 @@ export function parseSize(stdout: string): { width: number; height: number } | n
 }
 
 /**
- * Cells for a picture `rows` tall, a cell being about twice as tall as wide. Where `room` columns
- * are too few the width is capped and the height shrinks with it, so the proportions hold.
+ * Cells for a picture `rows` tall, a cell being about twice as tall as wide. Where the room (or
+ * MAX_COLUMNS, if that is less) is too narrow for it, the width is capped and the height shrinks
+ * with it, so the proportions hold.
  */
 export function boxFor(width: number, height: number, rows: number, room: number) {
+  const cap = Math.min(room, MAX_COLUMNS)
   const natural = Math.max(2, Math.round((rows * 2 * width) / height))
-  if (natural <= room) return { columns: Math.min(natural, MAX_COLUMNS), rows }
-  const columns = Math.min(MAX_COLUMNS, Math.max(2, room))
+  if (natural <= cap) return { columns: natural, rows }
+  const columns = Math.max(2, cap)
 
   return { columns, rows: Math.max(1, Math.min(rows, Math.round((columns * height) / (2 * width)))) }
 }

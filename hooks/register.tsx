@@ -7,21 +7,52 @@ import { ROWS, boxFor, isPastedName, parsePngSize, parseSize, projectFolder, tem
 const tiles = atom({ plugin: 'paste-thumb', key: 'tiles' } as const, [] as Tile[])
 
 const POLL_MS = 500
-const FIND_TRIES = 8
+// A tag gets this many polls to show its file: about ten seconds.
+const MAX_TRIES = 20
 
-// The module's own memory: rebuilt after a reload, while `tiles` stays.
+// The module's own memory. A reload resets it and drops the poll timer (`tiles` stays); session.start
+// then runs again and re-arms the poll. Everything that depends on the session is derived again
+// whenever the session's id changes, because `/clear` and a resume keep the process and raise no
+// session.start.
+let sid = ''
 let pasteDir = ''
 let work = ''
 let converter: Promise<string> | null = null // looked for once a session; '' when there is none
-let seen: string | null = null
+let stop: (() => void) | null = null
+let polling = false
+let warned = false
+let shown: string | null = null // the tiles last handed to the band, null: nothing yet, so the next poll writes
+let epoch = 0 // bumped whenever what was read no longer applies, so a late result is dropped
 const made = new Map<number, Tile>()
 const pending = new Set<number>()
+const tries = new Map<number, number>()
+
+const message = (error: unknown) => (error instanceof Error ? error.message : String(error))
+
+function forget() {
+  epoch += 1
+  made.clear()
+  pending.clear()
+  tries.clear()
+  converter = null
+  warned = false
+  shown = null
+}
 
 async function findConverter($: $): Promise<string> {
   const found = await $.process.run(['sh', '-c', 'command -v magick || command -v convert']).catch(() => null)
   const path = found?.stdout.trim().split('\n')[0] ?? ''
-  if (path) await $.process.run(['mkdir', '-p', work]).catch(() => null)
-  else $.ui.toast('paste-thumb: only PNG pictures show without ImageMagick (magick or convert)')
+  if (!path) {
+    $.ui.toast('paste-thumb: only PNG pictures show without ImageMagick (magick or convert)')
+
+    return ''
+  }
+  const dir = await $.process.run(['mkdir', '-p', work]).catch(() => null)
+  if (dir?.exitCode !== 0) {
+    $.ui.toast(`paste-thumb: cannot create ${work}`)
+
+    return ''
+  }
 
   return path
 }
@@ -34,81 +65,111 @@ async function convert($: $, n: number, src: string): Promise<Tile | null> {
   const out = `${work}/${n}-${await $.clock.now()}.png`
   const done = await $.process.run(thumbArgv(tool, src, out), { timeoutMs: 20_000 }).catch(() => null)
   const size = done?.exitCode === 0 ? parseSize(done.stdout) : null
+  if (!size) {
+    const why = done ? `exit ${done.exitCode}: ${done.stderr.slice(0, 200)}` : 'did not run or timed out'
+    $.ui.log(`paste-thumb: could not convert Image #${n} (${why})`, { to: 'debug' })
+  }
 
   return size ? { n, file: out, ...size } : null
 }
 
-// Claude Code stores a pasted image a moment after its tag shows. A PNG is read by the terminal
-// itself, from where it lies: only its size is taken, from the header.
-async function make($: $, n: number, attempt: number): Promise<void> {
+// One try at a tag. The pasted file may land after its tag shows, so a try that finds no file, or one
+// still being written, is repeated by the next poll, up to MAX_TRIES times. A PNG is read by the
+// terminal itself, from where it lies: only its size is taken, from the header.
+async function attempt($: $, n: number, at: number) {
   const entries = await $.fs.list(pasteDir).catch(() => [])
   const hit = entries.find(f => f.kind === 'file' && isPastedName(f.name, n))
-  if (!hit) {
-    if (attempt < FIND_TRIES) $.clock.after(250, () => void make($, n, attempt + 1))
-    else pending.delete(n)
-
-    return
-  }
-  const file = `${pasteDir}/${hit.name}`
-  const head = await $.process.run(['od', '-An', '-tu1', '-N24', file]).catch(() => null)
-  const png = head?.exitCode === 0 ? parsePngSize(head.stdout) : null
-  const tile = png ? { n, file, ...png } : await convert($, n, file)
-  pending.delete(n)
-  if (!tile) return // its tag stays plain text
-  made.set(n, tile)
-  seen = null // the next poll draws it
-}
-
-// Pasting an image raises no prompt.edit, so the draft's tags are polled.
-async function poll($: $) {
-  const { text } = await $.prompt.read()
-  const ns = tokensOf(text)
-  const key = ns.join(',')
-  if (key === seen) return
-  seen = key
-  // An empty draft: the tags were sent or deleted.
-  if (ns.length === 0) made.clear()
-  for (const n of ns) {
-    if (!made.has(n) && !pending.has(n)) {
-      pending.add(n)
-      void make($, n, 0)
+  if (hit && hit.size >= 24) {
+    const file = `${pasteDir}/${hit.name}`
+    const head = await $.process.run(['od', '-An', '-tu1', '-N24', file]).catch(() => null)
+    const png = head?.exitCode === 0 ? parsePngSize(head.stdout) : null
+    const tile = png ? { n, file, ...png } : await convert($, n, file)
+    if (tile && at === epoch) {
+      made.set(n, tile)
+      tries.delete(n)
+    } else if (!tile && at === epoch) {
+      // the file is there and would not convert (or is still being written): a few more tries, not the whole budget
+      tries.set(n, Math.max(tries.get(n) ?? 0, MAX_TRIES - 3))
     }
   }
-  await update($, tiles, () => ns.flatMap(n => made.get(n) ?? []))
+  if (at !== epoch) return
+  pending.delete(n)
+  if (!made.has(n) && (tries.get(n) ?? 0) >= MAX_TRIES && !warned) {
+    warned = true
+    $.ui.log(`paste-thumb: no readable ${n}.* in ${pasteDir} after ${MAX_TRIES} tries`, { to: 'debug' })
+    $.ui.toast(`paste-thumb: cannot find pasted Image #${n} in ${pasteDir}`)
+  }
 }
 
-async function findPasteDir($: $) {
+// <root>/<project>/<session>/images, the project being the cwd with every non-alphanumeric as "-".
+async function locate($: $, id: string) {
   const uid = (await $.process.run(['id', '-u']).catch(() => null))?.stdout.trim() || '0'
-  const sessionId = await $.session.id()
   const root = tempRoot(await $.env.get('CLAUDE_CODE_TMPDIR'), uid)
-
-  // <root>/<project>/<session>/images, the project being the cwd with every non-alphanumeric as "-".
-  let dir = `${root}/${projectFolder(await $.session.cwd())}/${sessionId}`
+  let dir = `${root}/${projectFolder(await $.session.cwd())}/${id}`
   if (!(await $.fs.exists(dir).catch(() => false))) {
     for (const entry of await $.fs.list(root).catch(() => [])) {
-      const candidate = `${root}/${entry.name}/${sessionId}`
+      const candidate = `${root}/${entry.name}/${id}`
       if (entry.kind === 'dir' && (await $.fs.exists(candidate).catch(() => false))) dir = candidate
     }
   }
+  const tmp = ((await $.env.get('TMPDIR')) || '/tmp').replace(/\/+$/, '')
 
-  work = `${((await $.env.get('TMPDIR')) || '/tmp').replace(/\/+$/, '')}/claude-paste-thumb/${sessionId.replace(/[^\w-]/g, '_')}`
+  return { pasteDir: `${dir}/images`, work: `${tmp}/claude-paste-thumb/${id.replace(/[^\w-]/g, '_')}` }
+}
 
-  return `${dir}/images`
+async function switchSession($: $, id: string) {
+  const old = work
+  forget()
+  sid = id
+  ;({ pasteDir, work } = await locate($, id))
+  if (old && old !== work) await $.process.run(['rm', '-rf', old]).catch(() => null)
+  await update($, tiles, () => [])
+}
+
+// The draft's tags are polled: an image paste is not known to raise a prompt event.
+async function poll($: $) {
+  const id = await $.session.id()
+  if (id !== sid) await switchSession($, id)
+  const ns = tokensOf((await $.prompt.read()).text)
+  // An empty draft: the tags were sent or deleted, and a number may come back for another picture.
+  if (ns.length === 0 && (made.size > 0 || tries.size > 0)) forget()
+  for (const n of ns) {
+    const count = tries.get(n) ?? 0
+    if (made.has(n) || pending.has(n) || count >= MAX_TRIES) continue
+    tries.set(n, count + 1)
+    pending.add(n)
+    void attempt($, n, epoch).catch(error => {
+      pending.delete(n)
+      $.ui.log(`paste-thumb: Image #${n}: ${message(error)}`, { to: 'debug' })
+    })
+  }
+  const have = ns.filter(n => made.has(n))
+  const key = have.join(',')
+  if (key === shown) return
+  shown = key
+  await update($, tiles, () => have.map(n => made.get(n)!))
+}
+
+function tick($: $) {
+  if (polling) return
+  polling = true
+  poll($)
+    .catch(error => $.ui.log(`paste-thumb: ${message(error)}`, { to: 'debug' }))
+    .finally(() => (polling = false))
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    converter = null
-    pasteDir = await findPasteDir($)
-    $.clock.every(POLL_MS, () => void poll($))
+    stop?.()
+    stop = e.isInteractive ? $.clock.every(POLL_MS, () => tick($)) : null
 
     return started
   })
 
   on('session.end', async ($, e, next) => {
-    if (converter && (await converter)) await $.process.run(['rm', '-rf', work]).catch(() => null)
-    made.clear()
+    if (work) await $.process.run(['rm', '-rf', work]).catch(() => null)
+    forget()
     await update($, tiles, () => [])
 
     return next(e)
