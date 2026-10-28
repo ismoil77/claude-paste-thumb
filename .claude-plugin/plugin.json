@@ -1,0 +1,24 @@
+{
+  "name": "paste-thumb",
+  "version": "0.1.0",
+  "description": "A thumbnail above the Claude Code prompt for every image you paste",
+  "author": {
+    "name": "Ismoil",
+    "url": "https://github.com/ismoil77"
+  },
+  "homepage": "https://github.com/ismoil77/claude-paste-thumb",
+  "repository": "https://github.com/ismoil77/claude-paste-thumb",
+  "license": "MIT",
+  "keywords": [
+    "images",
+    "paste",
+    "preview",
+    "thumbnails",
+    "mod",
+    "terminal",
+    "ghostty",
+    "kitty",
+    "claude-code"
+  ],
+  "types": "./types/index.d.ts"
+}

@@ -1,0 +1,26 @@
+{
+  "name": "claude-paste-thumb",
+  "owner": {
+    "name": "Ismoil",
+    "url": "https://github.com/ismoil77"
+  },
+  "plugins": [
+    {
+      "name": "paste-thumb",
+      "source": "./",
+      "description": "A thumbnail above the Claude Code prompt for every image you paste",
+      "category": "productivity",
+      "tags": [
+        "images",
+        "paste",
+        "preview",
+        "thumbnails",
+        "mod",
+        "terminal"
+      ]
+    }
+  ],
+  "metadata": {
+    "description": "A thumbnail above the Claude Code prompt for every image you paste"
+  }
+}
